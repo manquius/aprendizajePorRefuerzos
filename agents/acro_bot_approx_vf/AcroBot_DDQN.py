@@ -40,6 +40,122 @@ class Net(nn.Module):
         x = self.output(x)
         return x
 
+    def choose_action(self, state, epsilon):
+        """Chooses the next action according to the model trained and the policy"""
+
+        # exploits the current knowledge if the random number > epsilon, otherwise explores
+        if np.random.random() <= epsilon:
+            return self.env.action_space.sample()
+        else:
+            with torch.no_grad():
+                q = self.model(state)
+                argmax = torch.argmax(q)
+                return argmax.item()
+
+    def get_epsilon(self, episode):
+        """Returns an epsilon that decays over time until a minimum epsilon value is reached; in this case the minimum
+        value is returned"""
+        return max(self.epsilon_min, self.epsilon * math.exp(-self.epsilon_decay * episode))
+
+    def replay(self):
+        """Previously stored (s, a, r, s') tuples are replayed (that is, are added into the model). The size of the
+        tuples added is determined by the batch_size parameter"""
+
+        transitions, _ = self.memory.sample(self.batch_size)
+        # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
+        # detailed explanation). This converts batch-array of Transitions
+        # to Transition of batch-arrays.
+        batch = Transition(*zip(*transitions))
+        # Compute a mask of non-final states and concatenate the batch elements
+        # (a final state would've been the one after which simulation ended)
+        non_final_next_states = torch.stack([s for s in batch.next_state if s is not None])
+
+        non_final_mask = torch.stack(batch.done)
+        state_batch = torch.stack(batch.state)
+        action_batch = torch.stack(batch.action)
+        reward_batch = torch.stack(batch.reward)
+
+        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+        # columns of actions taken. These are the actions which would've been taken
+        # for each batch state according to policy_net
+        state_action_values = self.model(state_batch).gather(1, action_batch)
+
+        # Compute V(s_{t+1}) for all next states.
+        # Expected values of actions for non_final_next_states are computed based
+        # on the "older" target_net; selecting their best reward with max(1)[0].
+        # This is merged based on the mask, such that we'll have either the expected
+        # state value or 0 in case the state was final.
+        with torch.no_grad():
+            next_state_values = torch.zeros(self.batch_size, device=self.device)
+            next_state_values[non_final_mask] = self.target(non_final_next_states).max(1)[0].detach()
+            # Compute the expected Q values
+            expected_state_action_values = reward_batch + self.gamma * next_state_values
+
+        # Compute loss
+        loss = self.loss_fn(state_action_values, expected_state_action_values.unsqueeze(1))
+
+        if self.debug:
+            self.loss_list.append(loss)
+        # Optimize the model
+        self.optimizer.zero_grad()
+        loss.backward()
+        for param in self.model.parameters():
+            param.grad.data.clamp_(-1, 1)
+        self.optimizer.step()
+
+    def run(self):
+        """Main loop that controls the execution of the agent"""
+
+        scores = []
+        mean_scores = []
+        j = 0  # used for model2 update every c steps
+        for e in range(self.n_episodes):
+            state = self.env.reset()
+            state = torch.tensor(state, device=self.device, dtype=torch.float)
+            done = False
+            cum_reward = 0
+            while not done:
+                action = self.choose_action(
+                    state,
+                    self.get_epsilon(e))
+                next_state, reward, done, _ = self.env.step(action)
+                next_state = torch.tensor(next_state, device=self.device, dtype=torch.float)
+
+                cum_reward += reward
+                self.memory.push(
+                    state,  #Converted to tensor in choose_action method
+                    torch.tensor([action], device=self.device),
+                    None if done else next_state,
+                    torch.tensor(reward, device=self.device).clamp_(-1, 1),
+                    torch.tensor(not done, device=self.device, dtype=torch.bool))
+
+                if self.memory.__len__() >= self.batch_size:
+                    self.replay()
+
+                state = next_state
+                j += 1
+
+                # update second model
+                if j % self.c == 0:
+                    self.target.load_state_dict(self.model.state_dict())
+                    self.target.eval()
+
+            scores.append(cum_reward)
+            mean_score = np.mean(scores)
+            mean_scores.append(mean_score)
+            if e % 100 == 0 and self.debug:
+                print('[Episode {}] - Mean reward {}.'.format(e, mean_score))
+
+        # noinspection PyUnboundLocalVariable
+        print('[Episode {}] - Mean reward {}.'.format(e, mean_score))
+        return scores, mean_scores
+
+    def save(self, path):
+        torch.save(self.model, path)
+
+    def load(self, path):
+        self.model = torch.load(path)
+
 
 class DDQN:
     def __init__(self, env, n_episodes=1000, max_env_steps=None, gamma=0.9,
@@ -147,8 +263,7 @@ class DDQN:
         # state value or 0 in case the state was final.
         with torch.no_grad():
             next_state_values = torch.zeros(self.batch_size, device=self.device)
-            next_state_actions[non_final_mask] = self.model(non_final_next_states).argmax(1)[0].detach()
-            next_state_values[non_final_mask] = self.target(non_final_next_states)[next_state_actions[non_final_mask]].detach()
+            next_state_values[non_final_mask] = self.target(non_final_next_states).max(1)[0].detach()
             # Compute the expected Q values
             expected_state_action_values = reward_batch + self.gamma * next_state_values
 
