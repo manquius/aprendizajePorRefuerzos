@@ -147,9 +147,10 @@ class DDQN:
         # state value or 0 in case the state was final.
         with torch.no_grad():
             next_state_values = torch.zeros(self.batch_size, device=self.device)
-            next_state_actions = dict()
-            next_state_actions[non_final_mask] = self.model(non_final_next_states).argmax(1)[0].detach()
-            next_state_values[non_final_mask] = self.target(non_final_next_states)[next_state_actions[non_final_mask]].detach()
+            _, next_state_actions = self.model(non_final_next_states).max(1, keepdim=True)
+            next_state_values[non_final_mask] = self.target(non_final_next_states).gather(1, next_state_actions).squeeze()
+
+            
             # Compute the expected Q values
             expected_state_action_values = reward_batch + self.gamma * next_state_values
 
